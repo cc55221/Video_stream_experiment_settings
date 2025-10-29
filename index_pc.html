@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DASH + Server-driven ABR (English)</title>
+  <style>
+    body { max-width: 900px; margin: auto; padding: 8px; font-family: system-ui, -apple-system, Segoe UI, Arial, sans-serif; }
+    #log { white-space: pre-wrap; background: #0b1020; color: #c9d1d9; padding: 8px; border-radius: 8px; min-height: 140px; }
+    button { padding: 6px 10px; border-radius: 8px; border: 1px solid #ddd; background: #f6f8fa; }
+    input { padding: 6px; border-radius: 6px; border: 1px solid #ccc; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0; }
+    details { margin: 6px 0; }
+    .grid { display: grid; grid-template-columns: 140px 1fr; gap: 6px 10px; padding-top: 6px; }
+    video { width: 100%; background: #000; }
+  </style>
+</head>
+<body>
+  <h3>DASH + Server-driven ABR</h3>
+
+  <video id="v" controls playsinline muted></video>
+
+  <div class="row">
+    <button id="start">Start</button>
+    <button id="btnStartProf" title="Start collecting segment timing">Start Measure</button>
+    <button id="btnStopProf"  title="Stop collecting">Stop Measure</button>
+    <button id="btnDumpJson"  title="Export TTFB/download/total time + size per segment">Export JSON</button>
+    <button id="btnDumpCsv"   title="Export as CSV for Excel">Export CSV</button>
+    <button id="btnClear">Clear Log</button>
+  </div>
+
+  <details>
+    <summary>Settings (change YOUR_PC_IP to your PC IP)</summary>
+    <div class="grid">
+      <label for="mpd">MPD URL</label>
+      <input id="mpd" value="http://172.20.10.2:8000/out/stream.mpd">
+      <label for="decide">DECIDE API</label>
+      <input id="decide" value="http://172.20.10.2:5000/decide">
+    </div>
+  </details>
+
+  <pre id="log"></pre>
+
+  <script src="https://cdn.jsdelivr.net/npm/dashjs@4.7.4/dist/dash.all.min.js"></script>
+  <script>
+  const video   = document.getElementById('v');
+  const logEl   = document.getElementById('log');
+  const mpdEl   = document.getElementById('mpd');
+  const decideEl= document.getElementById('decide');
+
+  function log(s){ console.log(s); logEl.textContent += s + "\n"; }
+  function safeGet(fn, def=0){ try{ const v = fn(); return (Number.isFinite(v)?v:def) } catch(_){ return def } }
+
+  const player  = dashjs.MediaPlayer().create();
+  player.updateSettings({ streaming:{ abr:{ autoSwitchBitrate:{ video:true }}}}); // 服务器端ABR，用false
+  player.initialize(video);  // 先只绑 <video>，不传 URL
+
+  // server-driven ABR polling
+  let ticking = false;
+  async function tick(){
+    if(!ticking) return;
+    const stats = {
+      buffer:      safeGet(()=>player.getBufferLength('video'), 0),
+      bitrateList: ( ()=>{ try{ return player.getBitrateInfoListFor('video').map(b=>b.bitrate) }catch(_){ return [] } } )(),
+      throughput:  safeGet(()=>player.getAverageThroughput('video'), 0) // kbps
+    };
+    try{
+      const r = await fetch(decideEl.value, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(stats)});
+      if(r.ok){
+        const {level} = await r.json();
+        if(Number.isFinite(level)) player.setQualityFor('video', level);
+        log(`[server] level=${level} buffer=${stats.buffer.toFixed(2)}s thr=${stats.throughput|0}kbps`);
+      }
+    }catch(_){/* ignore network errors during warmup */}
+    setTimeout(tick, 1000);
+  }
+
+  // measurement via Resource Timing + dash.js events fallback
+  performance.setResourceTimingBufferSize?.(5000);
+  let measuring = false;
+  let segRows = [];  // {name,type,start,ttfb_ms,download_ms,total_ms,transfer_bytes,quality,num}
+
+  function startMeasure(){
+    measuring = true;
+    segRows = [];
+    performance.clearResourceTimings?.();
+    log('Start measuring (cleared previous ResourceTiming entries)');
+  }
+  function stopMeasure(){ measuring = false; log('Stop measuring'); }
+
+  function harvestResourceTimings(){
+    if(!measuring) return;
+    const es = performance.getEntriesByType('resource')
+      .filter(e => /\.(m4s|mp4|ts)$/i.test(e.name));
+    const rows = es.map(e=>{
+      const start = e.startTime || 0;
+      const ttfb  = (e.responseStart??0) - start;
+      const down  = (e.responseEnd??0)   - (e.responseStart??0);
+      const total = e.duration || (ttfb + down);
+      const size  = (e.transferSize ?? e.encodedBodySize ?? 0);
+      const base  = e.name.split('/').pop();
+      return {
+        name: base, type: 'rt',
+        start: +start.toFixed(1),
+        ttfb_ms: +ttfb.toFixed(1),
+        download_ms: +down.toFixed(1),
+        total_ms: +total.toFixed(1),
+        transfer_bytes: size|0,
+        quality: guessQualityFromName(base),
+        num: guessNumberFromName(base)
+      };
+    });
+    const key = r => `${r.name}|${r.type}|${r.start}`;
+    const seen = new Set(segRows.map(key));
+    for(const r of rows){
+      const k = key(r);
+      if(!seen.has(k)){ segRows.push(r); seen.add(k); }
+    }
+  }
+
+  player.on(dashjs.MediaPlayer.events.FRAGMENT_LOADING_COMPLETED, e=>{
+    if(!measuring) return;
+    if(!e || !e.request) return;
+    const url = e.request.url || '';
+    const base = url.split('/').pop();
+    const q = Number.isFinite(e.request.quality) ? e.request.quality : undefined;
+    const idx = Number.isFinite(e.request.index) ? e.request.index : undefined;
+    const row = {
+      name: base, type:'evt',
+      start: NaN, ttfb_ms: NaN, download_ms: NaN, total_ms: NaN,
+      transfer_bytes: NaN, quality: q, num: idx
+    };
+    segRows.push(row);
+  });
+
+  function guessQualityFromName(name){
+    const m = name && name.match(/chunk-(\d+)-/);
+    return m ? +m[1] : undefined;
+  }
+  function guessNumberFromName(name){
+    const m = name && name.match(/-(\d+)\.m4s$/i);
+    return m ? +m[1] : undefined;
+  }
+
+  const startBtn      = document.getElementById('start');
+  const btnStartProf  = document.getElementById('btnStartProf');
+  const btnStopProf   = document.getElementById('btnStopProf');
+  const btnDumpJson   = document.getElementById('btnDumpJson');
+  const btnDumpCsv    = document.getElementById('btnDumpCsv');
+  const btnClear      = document.getElementById('btnClear');
+
+  startBtn.onclick = async ()=>{
+  try { player.attachSource(mpdEl.value); } catch(_){}
+
+  // ★ 移动端强制条件：静音 + 内联
+  try {
+    video.setAttribute('playsinline', '');
+    video.setAttribute('webkit-playsinline', '');
+    video.muted = true;
+  } catch(_) {}
+
+  // ★ 立即给一个初始层（双保险）
+  try { player.setQualityFor('video', 0); } catch(_){}
+
+  try { await video.play(); } catch(_) {}
+
+  if(!ticking){ ticking = true; tick(); }
+  startBtn.disabled = true; startBtn.textContent = "Playing…";
+  };
+
+  btnStartProf.onclick = ()=> startMeasure();
+  btnStopProf.onclick  = ()=> stopMeasure();
+
+  btnDumpJson.onclick = ()=>{
+    harvestResourceTimings();
+    const out = {
+      note: "Segment timings collected from ResourceTiming (primary) and dash.js events (fallback).",
+      mpd: mpdEl.value,
+      collected_at_ms: Date.now(),
+      rows: segRows
+    };
+    downloadText("segment_timings.json", JSON.stringify(out, null, 2));
+    log(`Exported JSON: ${segRows.length} rows`);
+  };
+
+  btnDumpCsv.onclick = ()=>{
+    harvestResourceTimings();
+    const header = ["name","type","start","ttfb_ms","download_ms","total_ms","transfer_bytes","quality","num"];
+    const lines = [header.join(",")];
+    for(const r of segRows){ lines.push(header.map(k => (r[k]??"")).join(",")); }
+    downloadText("segment_timings.csv", lines.join("\n"));
+    log(`Exported CSV: ${segRows.length} rows`);
+  };
+
+  btnClear.onclick = ()=>{
+    logEl.textContent = "";
+    segRows = [];
+    performance.clearResourceTimings?.();
+    log("Cleared log and measurement cache");
+  };
+
+  player.on(dashjs.MediaPlayer.events.STREAM_INITIALIZED, ()=>{
+    player.setQualityFor('video', 0);   // ★ 先手设一个初始层
+    if(!ticking){ ticking = true; tick(); }
+  });
+  setTimeout(()=>{ try{ player.setQualityFor('video',0); }catch(_){} }, 1500);
+
+  player.on(dashjs.MediaPlayer.events.PLAYBACK_STALLED, ()=>log('[event] STALL'));
+  player.on(dashjs.MediaPlayer.events.QUALITY_CHANGE_RENDERED, e=>log('[event] Q='+e.newQuality));
+
+  function downloadText(filename, text){
+    const blob = new Blob([text], {type:'text/plain;charset=utf-8'});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = filename;
+    a.click();
+    setTimeout(()=>URL.revokeObjectURL(a.href), 1000);
+  }
+
+  setInterval(harvestResourceTimings, 1000);
+  </script>
+</body>
+</html>

@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>DASH + Server-driven ABR (本地 dash.js)</title>
+  <style>
+    body{max-width:900px;margin:16px auto;padding:8px;font-family:system-ui,-apple-system,Segoe UI,Arial,sans-serif}
+    video{width:100%;background:#000;height:240px}
+    .row{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0}
+    input{width:100%;padding:6px;border:1px solid #ccc;border-radius:6px}
+    button{padding:6px 10px;border-radius:8px;border:1px solid #ddd;background:#f6f8fa}
+    #log{white-space:pre-wrap;background:#0b1020;color:#c9d1d9;padding:8px;border-radius:8px;min-height:140px}
+    .grid{display:grid;grid-template-columns:120px 1fr;gap:6px 10px}
+    details{margin:8px 0}
+  </style>
+</head>
+<body>
+  <h3>DASH + Server-driven ABR（离线版）</h3>
+
+  <video id="v" controls muted playsinline></video>
+
+  <div class="row">
+    <button id="start">Start</button>
+    <button id="btnStartProf" title="开始采集分片计时">Start Measure</button>
+    <button id="btnStopProf"  title="停止采集">Stop Measure</button>
+    <button id="btnDumpJson"  title="导出 JSON">Export JSON</button>
+    <button id="btnDumpCsv"   title="导出 CSV">Export CSV</button>
+    <button id="btnClear">Clear Log</button>
+  </div>
+
+  <details open>
+    <summary>Settings（把 IP 改成你的 PC IP）</summary>
+    <div class="grid">
+      <label for="mpd">MPD URL</label>
+      <input id="mpd" value="/out/stream.mpd">
+      <label for="decide">DECIDE API</label>
+      <input id="decide" value="http://172.20.10.2:5000/decide">
+    </div>
+  </details>
+
+  <pre id="log">Cleared log and measurement cache</pre>
+
+  <!-- 使用本地 dash.js，不依赖外网 -->
+  <script src="./js/dash.all.min.js"></script>
+  <script>
+  const video    = document.getElementById('v');
+  const mpdEl    = document.getElementById('mpd');
+  const decideEl = document.getElementById('decide');
+  const logEl    = document.getElementById('log');
+  const startBtn = document.getElementById('start');
+  const btnStart = document.getElementById('btnStartProf');
+  const btnStop  = document.getElementById('btnStopProf');
+  const btnJson  = document.getElementById('btnDumpJson');
+  const btnCsv   = document.getElementById('btnDumpCsv');
+  const btnClear = document.getElementById('btnClear');
+
+  function log(s){ console.log(s); logEl.textContent += "\n" + s; }
+  const mseOK = (typeof window.MediaSource !== 'undefined');
+  log('MSE support = ' + mseOK);
+
+  function safeGet(fn, def=0){ try{ const v=fn(); return Number.isFinite(v)?v:def }catch(_){ return def } }
+
+  // 创建播放器：关闭 dash.js 本地 ABR，用“服务器端 ABR”
+  const player = dashjs.MediaPlayer().create();
+  player.updateSettings({ streaming:{ abr:{ autoSwitchBitrate:{ video:false }}}});
+  player.initialize(video);  // 先只绑定 <video>，不传 URL
+  
+  player.on(dashjs.MediaPlayer.events.ERROR, e => {
+  log('[dash.js ERROR] ' + JSON.stringify(e));
+  });
+  player.on(dashjs.MediaPlayer.events.MANIFEST_LOADED, () => {
+    log('[dash.js] MPD loaded OK');
+  });
+  player.on(dashjs.MediaPlayer.events.STREAM_INITIALIZED, () => {
+    log('[dash.js] STREAM_INITIALIZED');
+  });
+
+  // —— 服务器端 ABR 轮询 —— //
+  let ticking = false;
+  async function tick(){
+    if(!ticking) return;
+    const stats = {
+      buffer:     safeGet(()=>player.getBufferLength('video'), 0),
+      bitrateList: ( ()=>{ try{ return player.getBitrateInfoListFor('video').map(b=>b.bitrate) }catch(_){ return [] } } )(),
+      throughput: safeGet(()=>player.getAverageThroughput('video'), 0) // kbps
+    };
+    try{
+      const r = await fetch(decideEl.value, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(stats)});
+      if(r.ok){
+        const {level} = await r.json();
+        if(Number.isFinite(level)) player.setQualityFor('video', level);
+        log(`[server] level=${level} buffer=${stats.buffer.toFixed(2)}s thr=${stats.throughput|0}kbps`);
+      }
+    }catch(_){/* 初始阶段可能还没有吞吐，忽略错误 */}
+    setTimeout(tick, 1000);
+  }
+
+  // —— 分片计时&导出 —— //
+  performance.setResourceTimingBufferSize?.(5000);
+  let measuring = false, segRows = [];
+
+  function startMeasure(){ measuring = true; segRows=[]; performance.clearResourceTimings?.(); log('Start measuring'); }
+  function stopMeasure(){  measuring = false; log('Stop measuring'); }
+
+  function harvestResourceTimings(){
+    if(!measuring) return;
+    const es = performance.getEntriesByType('resource').filter(e => /\.(m4s|mp4|ts)$/i.test(e.name));
+    const rows = es.map(e=>{
+      const start = e.startTime||0, ttfb=(e.responseStart??0)-start, down=(e.responseEnd??0)-(e.responseStart??0);
+      const total = e.duration || (ttfb+down);
+      const size  = (e.transferSize ?? e.encodedBodySize ?? 0);
+      const base  = (e.name||'').split('/').pop();
+      return { name:base,type:'rt',start:+start.toFixed(1),ttfb_ms:+ttfb.toFixed(1),download_ms:+down.toFixed(1),
+               total_ms:+total.toFixed(1),transfer_bytes:size|0,quality:guessQ(base),num:guessN(base) };
+    });
+    const key=r=>`${r.name}|${r.type}|${r.start}`; const seen=new Set(segRows.map(key));
+    for(const r of rows){ const k=key(r); if(!seen.has(k)){ segRows.push(r); seen.add(k); } }
+  }
+
+  player.on(dashjs.MediaPlayer.events.FRAGMENT_LOADING_COMPLETED, e=>{
+    if(!measuring || !e?.request) return;
+    const base=(e.request.url||'').split('/').pop();
+    segRows.push({name:base,type:'evt',start:NaN,ttfb_ms:NaN,download_ms:NaN,total_ms:NaN,
+                  transfer_bytes:NaN,quality: e.request.quality, num: e.request.index});
+  });
+
+  function guessQ(name){ const m=name?.match(/chunk-(\d+)-/); return m?+m[1]:undefined; }
+  function guessN(name){ const m=name?.match(/-(\d+)\.m4s$/i); return m?+m[1]:undefined; }
+  setInterval(harvestResourceTimings, 1000);
+
+  // —— 起播：挂 MPD + 先手选一层 + 手势播放 —— //
+  player.on(dashjs.MediaPlayer.events.STREAM_INITIALIZED, ()=>{
+    try{ player.setQualityFor('video',0); }catch(_){}
+    if(!ticking){ ticking=true; tick(); }
+  });
+
+  player.on(dashjs.MediaPlayer.events.ERROR, e => {
+  log('[dash.js ERROR] ' + JSON.stringify(e));
+  });
+  player.on(dashjs.MediaPlayer.events.MANIFEST_LOADED, e => {
+    log('[dash.js] MPD loaded OK');
+  });
+
+  // 兜底：某些机型事件晚到，再补一次
+  setTimeout(()=>{ try{ player.setQualityFor('video',0); }catch(_){} }, 1500);
+
+  startBtn.onclick = async ()=>{
+  const u = mpdEl.value.trim();
+
+  // ① 先 HEAD 探测，强制在服务器黑框打点
+  try{
+    await fetch(u, { method: 'HEAD', cache: 'no-store' });
+    log('[probe] MPD reachable: ' + u);
+  }catch(err){
+    log('[probe ERROR] ' + err);
+    return;
+  }
+
+  // ② 真 GET 一次 MPD，把前两行 XML 打到日志
+  try{
+    const txt = await (await fetch(u, {cache:'no-store'})).text();
+    log('[mpd head]\n' + txt.split('\n').slice(0,2).join('\n'));
+  }catch(err){
+    log('[GET MPD ERROR] ' + err);
+    return;
+  }
+
+  // ③ 挂源 + 自动播放 + 启动轮询
+  try{ player.attachSource(u); }catch(e){ log('[attach ERROR] ' + e); }
+  try{
+    video.setAttribute('playsinline','');
+    video.setAttribute('webkit-playsinline','');
+    video.muted = true;
+    await video.play();
+  }catch(e){ log('[video.play ERROR] ' + e); }
+
+  if(!ticking){ ticking = true; tick(); }
+  startBtn.disabled = true; startBtn.textContent = 'Playing…';
+  };
+
+
+  // —— 采集与导出 —— //
+  btnStart.onclick = ()=> startMeasure();
+  btnStop.onclick  = ()=> stopMeasure();
+
+  btnJson.onclick = ()=>{
+    harvestResourceTimings();
+    const out = { note:"Segment timings from ResourceTiming & dash.js events", mpd: mpdEl.value,
+                  collected_at_ms: Date.now(), rows: segRows };
+    downloadText('segment_timings.json', JSON.stringify(out,null,2));
+    log(`Exported JSON: ${segRows.length} rows`);
+  };
+
+  btnCsv.onclick = ()=>{
+    harvestResourceTimings();
+    const header = ["name","type","start","ttfb_ms","download_ms","total_ms","transfer_bytes","quality","num"];
+    const lines = [header.join(",")];
+    for(const r of segRows) lines.push(header.map(k => (r[k]??"")).join(","));
+    downloadText('segment_timings.csv', lines.join("\n"));
+    log(`Exported CSV: ${segRows.length} rows`);
+  };
+
+  btnClear.onclick = ()=>{
+    logEl.textContent = "Cleared log and measurement cache";
+    segRows=[]; performance.clearResourceTimings?.();
+  };
+
+  function downloadText(filename, text){
+    const blob = new Blob([text], {type:'text/plain;charset=utf-8'});
+    const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = filename; a.click();
+    setTimeout(()=>URL.revokeObjectURL(a.href), 1000);
+  }
+  </script>
+</body>
+</html>
